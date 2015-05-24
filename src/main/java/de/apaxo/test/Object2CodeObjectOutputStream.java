@@ -26,14 +26,18 @@ import java.util.logging.Logger;
  * Generic information will be lost during the serialization.
  * 
  * @author Manuel Blechschmidt <blechschmidt@apaxo.de>
+ * @author Klaus Pfeiffer <klaus@allpiper.com>
  * 
  */
 public class Object2CodeObjectOutputStream implements AutoCloseable {
 
-    private static final Logger log = Logger
-            .getLogger(Object2CodeObjectOutputStream.class.getName());
+    private static final Logger log = Logger.getLogger(Object2CodeObjectOutputStream.class.getName());
 
     private OutputStream out;
+
+    private boolean readableVariableNames = true;
+
+    private String firstVariableName;
 
     /**
     * Generate a new Object2CodeObjectOutputStream based on an OutputStream
@@ -121,121 +125,148 @@ public class Object2CodeObjectOutputStream implements AutoCloseable {
             } else if (clazz == String.class) {
                 return "\"" + o.toString() + "\"";
             } else if (clazz.isEnum()) {
-            	return clazz.getName() + "." + ((Enum) o).name();
+            	return retrieveClassName(clazz) + "." + ((Enum) o).name();
+            } else if (clazz == Class.class) {
+                return ((Class)o).getCanonicalName() + ".class";
+            } else if (clazz == String[].class) {
+                StringBuilder sb = new StringBuilder();
+                String[] sa = (String[])o;
+                sb.append("new String[] {");
+                for (int i = 0; i < sa.length; i++) {
+                    String s = sa[i];
+                    sb.append("\"");
+                    sb.append(s);
+                    sb.append("\"");
+                    if (i < sa.length - 1) {
+                        sb.append(",");
+                    }
+                }
+                sb.append("}");
+                return sb.toString();
             }
             BeanInfo beanInfo = Introspector.getBeanInfo(clazz);
+
             // This should throw an exception if there is no
             // args constructor
             clazz.getConstructor();
             String beanName = getVariableName(clazz, clazz2count);
             object2variableName.put(o, beanName);
-            out.write((clazz.getName() + " " + beanName + " = new "
-                    + clazz.getName() + "();\n").getBytes());
-            for (PropertyDescriptor propertyDescriptor : beanInfo
-                    .getPropertyDescriptors()) {
+            out.write((retrieveClassName(clazz) + " " + beanName + " = new "
+                    + retrieveClassName(clazz) + "();\n").getBytes());
+            for (PropertyDescriptor propertyDescriptor : beanInfo.getPropertyDescriptors()) {
             	if (onlyPropertiesWithMatchingField) {
-            		try {
-    					clazz.getDeclaredField(propertyDescriptor.getName());
-    				} catch (NoSuchFieldException e) {
-    					log.info("Skipping method without matching field: " + propertyDescriptor.getName());
-    					continue;
-    				}
+                    boolean propertyFound = false;
+                    Class<?> superclass = clazz;
+                    while (superclass != null) {
+                        try {
+                            superclass.getDeclaredField(propertyDescriptor.getName());
+                        } catch (NoSuchFieldException e) {
+                            superclass = superclass.getSuperclass();
+                            if (superclass == null) {
+                                break;
+                            }
+                            continue;
+                        }
+                        propertyFound = true;
+                        break;
+                    }
+
+                    if (!propertyFound) {
+                        log.info("Skipping method without matching field: " + propertyDescriptor.getName());
+                        continue;
+                    }
             	}
+
                 Class<?> propertyClass = propertyDescriptor.getPropertyType();
-                Object propertyValue = propertyDescriptor.getReadMethod()
-                        .invoke(o);
-                if (propertyValue != null) {
-                    if (propertyClass.isPrimitive()) {
-                        Method writeMethod = propertyDescriptor
-                                .getWriteMethod();
-                        if (writeMethod != null) {
+                Method readMethod = propertyDescriptor.getReadMethod();
+                Method writeMethod = propertyDescriptor.getWriteMethod();
+
+                if (readMethod == null) {
+                    log.warning("Can't find read method for: "
+                            + o.getClass().getName() + " "
+                            + propertyDescriptor.getName());
+                } else if (writeMethod == null) {
+                    log.warning("Can't find write method for: "
+                            + o.getClass().getName() + " "
+                            + propertyDescriptor.getName());
+                } else {
+                    Object propertyValue = readMethod.invoke(o);
+                    if (propertyValue != null) {
+                        if (propertyClass.isPrimitive()) {
                             out.write((beanName + "." + writeMethod.getName()
                                     + "("
                                     + formatType(propertyClass, propertyValue) + ");\n")
                                     .getBytes());
+                        } else if (propertyClass == String.class) {
+                            out.write((beanName + "."
+                                    + propertyDescriptor.getWriteMethod().getName()
+                                    + "(\"" + propertyValue + "\");\n").getBytes());
                         } else {
-                            log.warning("Can not find write method for: "
-                                    + o.getClass().getName() + " "
-                                    + propertyDescriptor.getName());
-                        }
-                    } else if (propertyClass == String.class) {
-                        out.write((beanName + "."
-                                + propertyDescriptor.getWriteMethod().getName()
-                                + "(\"" + propertyValue + "\");\n").getBytes());
-                    } else {
-                        if (Collection.class.isAssignableFrom(propertyClass)) {
-                            Collection<?> collection = (Collection<?>) propertyValue;
-                            Class<?> collectionImplementation = collection
-                                    .getClass();
-                            String collectionName = getVariableName(
-                                    collectionImplementation, clazz2count);
-                            object2variableName.put(collection, collectionName);
-                            out.write((collectionImplementation.getName() + " "
-                                    + collectionName + " = new "
-                                    + collectionImplementation.getName() + "();\n")
-                                    .getBytes());
-                            for (Object item : collection) {
-                                String itemName = writeObject(item,
-                                        clazz2count, object2variableName, onlyPropertiesWithMatchingField);
-                                out.write((collectionName + ".add(" + itemName + ");\n")
+                            if (Collection.class.isAssignableFrom(propertyClass)) {
+                                Collection<?> collection = (Collection<?>) propertyValue;
+                                Class<?> collectionImplementation = collection
+                                        .getClass();
+                                String collectionName = getVariableName(
+                                        collectionImplementation, clazz2count);
+                                object2variableName.put(collection, collectionName);
+                                out.write((collectionImplementation.getName() + " "
+                                        + collectionName + " = new "
+                                        + collectionImplementation.getName() + "();\n")
                                         .getBytes());
-                            }
-                            out.write((beanName
-                                    + "."
-                                    + propertyDescriptor.getWriteMethod()
-                                            .getName() + "(" + collectionName + ");\n")
-                                    .getBytes());
-                        } else if (Map.class.isAssignableFrom(propertyClass)) {
-                            Map<?, ?> map = (Map<?, ?>) propertyValue;
-                            Class<?> mapImplementation = map.getClass();
-                            String mapName = getVariableName(mapImplementation,
-                                    clazz2count);
-                            object2variableName.put(map, mapName);
-                            out.write((mapImplementation.getName() + " "
-                                    + mapName + " = new "
-                                    + mapImplementation.getName() + "();\n")
-                                    .getBytes());
-                            for (Entry<?, ?> item : map.entrySet()) {
-                                String keyName = object2variableName
-                                        .containsKey(item.getKey()) ? object2variableName
-                                        .get(item.getKey()) : writeObject(
-                                        item.getKey(), clazz2count,
-                                        object2variableName, onlyPropertiesWithMatchingField);
-                                String valueName = object2variableName
-                                        .containsKey(item.getValue()) ? object2variableName
-                                        .get(item.getValue()) : writeObject(
-                                        item.getValue(), clazz2count,
-                                        object2variableName, onlyPropertiesWithMatchingField);
-
-                                out.write((mapName + ".put(" + keyName + ", "
-                                        + valueName + ");\n").getBytes());
-                            }
-                            out.write((beanName
-                                    + "."
-                                    + propertyDescriptor.getWriteMethod()
-                                            .getName() + "(" + mapName + ");\n")
-                                    .getBytes());
-                        } else if (propertyClass != Class.class) {
-                            String newBeanName = object2variableName
-                                    .containsKey(propertyValue) ? object2variableName
-                                    .get(propertyValue) : writeObject(
-                                    propertyValue, clazz2count,
-                                    object2variableName, onlyPropertiesWithMatchingField);
-
-                            Method writeMethod = propertyDescriptor
-                                    .getWriteMethod();
-                            if (writeMethod != null) {
+                                for (Object item : collection) {
+                                    String itemName = writeObject(item,
+                                            clazz2count, object2variableName, onlyPropertiesWithMatchingField);
+                                    out.write((collectionName + ".add(" + itemName + ");\n")
+                                            .getBytes());
+                                }
                                 out.write((beanName
                                         + "."
                                         + propertyDescriptor.getWriteMethod()
-                                                .getName() + "(" + newBeanName + ");\n")
+                                        .getName() + "(" + collectionName + ");\n")
                                         .getBytes());
-                            } else {
-                                log.warning("Can not find write method for: "
-                                        + o.getClass().getName() + " "
-                                        + propertyDescriptor.getName());
-                            }
+                            } else if (Map.class.isAssignableFrom(propertyClass)) {
+                                Map<?, ?> map = (Map<?, ?>) propertyValue;
+                                Class<?> mapImplementation = map.getClass();
+                                String mapName = getVariableName(mapImplementation,
+                                        clazz2count);
+                                object2variableName.put(map, mapName);
+                                out.write((mapImplementation.getName() + " "
+                                        + mapName + " = new "
+                                        + mapImplementation.getName() + "();\n")
+                                        .getBytes());
+                                for (Entry<?, ?> item : map.entrySet()) {
+                                    String keyName = object2variableName
+                                            .containsKey(item.getKey()) ? object2variableName
+                                            .get(item.getKey()) : writeObject(
+                                            item.getKey(), clazz2count,
+                                            object2variableName, onlyPropertiesWithMatchingField);
+                                    String valueName = object2variableName
+                                            .containsKey(item.getValue()) ? object2variableName
+                                            .get(item.getValue()) : writeObject(
+                                            item.getValue(), clazz2count,
+                                            object2variableName, onlyPropertiesWithMatchingField);
 
+                                    out.write((mapName + ".put(" + keyName + ", "
+                                            + valueName + ");\n").getBytes());
+                                }
+                                out.write((beanName
+                                        + "."
+                                        + propertyDescriptor.getWriteMethod()
+                                        .getName() + "(" + mapName + ");\n")
+                                        .getBytes());
+                            } else if (propertyClass != Class.class) {
+                                String newBeanName = object2variableName
+                                        .containsKey(propertyValue) ? object2variableName
+                                        .get(propertyValue) : writeObject(
+                                        propertyValue, clazz2count,
+                                        object2variableName, onlyPropertiesWithMatchingField);
+
+                                out.write((beanName
+                                        + "."
+                                        + propertyDescriptor.getWriteMethod()
+                                        .getName() + "(" + newBeanName + ");\n")
+                                        .getBytes());
+                            }
                         }
                     }
                 }
@@ -258,6 +289,10 @@ public class Object2CodeObjectOutputStream implements AutoCloseable {
         }
         throw new RuntimeException(
                 "Could not serialize the given object to code. Please see the warnings in the log.");
+    }
+
+    private String retrieveClassName(Class<?> clazz) {
+        return clazz.getName().replaceAll("\\$", ".");
     }
 
     /**
@@ -292,6 +327,7 @@ public class Object2CodeObjectOutputStream implements AutoCloseable {
         }
     }
 
+    int count = 0;
     /**
      * Get a variable name for the given class this also makes sure if a certain
      * class has multiple instance they get different names.
@@ -301,17 +337,29 @@ public class Object2CodeObjectOutputStream implements AutoCloseable {
      * @param clazz2count
      *            how many instances of the classes do we already have
      */
-    private String getVariableName(Class<?> clazz,
-            Map<Class<?>, Integer> clazz2count) {
-        int count = 0;
-        if (clazz2count.containsKey(clazz)) {
-            count = clazz2count.get(clazz);
-            count++;
-            clazz2count.put(clazz, count);
+    private String getVariableName(Class<?> clazz, Map<Class<?>, Integer> clazz2count) {
+        String varName;
+        if (!readableVariableNames) {
+            if (count == 0) {
+                count++;
+                return Introspector.decapitalize(clazz.getSimpleName()) + "0";
+            }
+            varName = "_" + Integer.toHexString(count++);
         } else {
-            clazz2count.put(clazz, count);
+            int count = 0;
+            if (clazz2count.containsKey(clazz)) {
+                count = clazz2count.get(clazz);
+                count++;
+                clazz2count.put(clazz, count);
+            } else {
+                clazz2count.put(clazz, count);
+            }
+            varName = Introspector.decapitalize(clazz.getSimpleName()) + count;
         }
-        return Introspector.decapitalize(clazz.getSimpleName()) + count;
+        if (firstVariableName == null) {
+            firstVariableName = varName;
+        }
+        return varName;
     }
 
     @Override
@@ -323,4 +371,15 @@ public class Object2CodeObjectOutputStream implements AutoCloseable {
         }
     }
 
+    public boolean isReadableVariableNames() {
+        return readableVariableNames;
+    }
+
+    public void setReadableVariableNames(boolean readableVariableNames) {
+        this.readableVariableNames = readableVariableNames;
+    }
+
+    public String getFirstVariableName() {
+        return firstVariableName;
+    }
 }
